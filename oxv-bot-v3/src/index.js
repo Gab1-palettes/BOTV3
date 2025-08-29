@@ -1,13 +1,11 @@
 // ---- Handlers de robustesse (à placer en tout début) ----
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err?.stack || err);
-  // ne pas process.exit; on continue pour que Render ne coupe pas
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
 });
 
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("[unhandledRejection]", reason);
-  // ne pas process.exit
-});
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -27,16 +25,25 @@ import { securityStack } from "./middleware/security.js";
 
 // ---------- App Bootstrap ----------
 const app = express();
-app.set("trust proxy", 1); // nécessaire sur Render pour req.protocol = https derrière proxy
+app.set("trust proxy", 1); // Render: req.protocol = https via proxy
 
-// CORS: autorise localhost (dev) et onrender.com (prod)
-app.use(cors({
-  origin: [/^https?:\/\/localhost(:\d+)?$/, /onrender\.com$/],
-  credentials: false
-}));
+// CORS: localhost (dev) + onrender.com (prod)
+app.use(
+  cors({
+    origin: [/^https?:\/\/localhost(:\d+)?$/, /onrender\.com$/],
+    credentials: false,
+  })
+);
 
 app.use(express.json({ limit: "2mb" }));
-securityStack().forEach(mw => app.use(mw));
+
+// Sécurité (protégé au cas où l'init jette)
+try {
+  securityStack().forEach((mw) => app.use(mw));
+} catch (e) {
+  console.error("[securityStack init error]", e);
+}
+
 app.use(logger);
 
 // Dossiers statiques & stockage
@@ -66,7 +73,9 @@ function extractJsonCandidate(txt) {
   // 1) Bloc ```json ... ```
   const fence = /```json\s*([\s\S]*?)\s*```/i.exec(txt);
   if (fence?.[1]) {
-    try { return JSON.parse(fence[1]); } catch {}
+    try {
+      return JSON.parse(fence[1]);
+    } catch {}
   }
 
   // 2) Premier objet {...} équilibré
@@ -74,16 +83,21 @@ function extractJsonCandidate(txt) {
   const end = txt.lastIndexOf("}");
   if (start !== -1 && end !== -1 && end > start) {
     const slice = txt.slice(start, end + 1);
-    try { return JSON.parse(slice); } catch {}
+    try {
+      return JSON.parse(slice);
+    } catch {}
   }
 
   // 3) Tentative directe
-  try { return JSON.parse(txt); } catch {}
+  try {
+    return JSON.parse(txt);
+  } catch {}
   return null;
 }
 
 function safeShorten(text, maxSentences = 2) {
-  if (!text) return "Pouvez-vous préciser votre besoin ? Je peux créer un plan, un devis ou estimer la livraison.";
+  if (!text)
+    return "Pouvez-vous préciser votre besoin ? Je peux créer un plan, un devis ou estimer la livraison.";
   const parts = text.split(/[.!?]\s/).slice(0, maxSentences).join(". ");
   return parts.endsWith(".") ? parts : parts + ".";
 }
@@ -100,7 +114,9 @@ function ensureSession(sessId) {
 
 // ---------- Routes ----------
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("OXV-API en ligne. Routes: /health, /session/start, /chat, /plan, /devis, /transport");
+  res
+    .type("text/plain")
+    .send("AOA-API en ligne. Routes: /health, /session/start, /chat, /plan, /devis, /transport");
 });
 
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
@@ -110,117 +126,167 @@ app.post("/session/start", (_req, res) => {
   res.json({ session_id: id });
 });
 
-app.post("/chat", asyncHandler(async (req, res) => {
-  const { session_id, message } = req.body || {};
-  if (!message || typeof message !== "string") {
-    return res.status(400).json({ error: "message manquant", hint: "Envoyez { session_id?, message: '...' }" });
-  }
+app.post(
+  "/chat",
+  asyncHandler(async (req, res) => {
+    const { session_id, message } = req.body || {};
+    if (!message || typeof message !== "string") {
+      return res
+        .status(400)
+        .json({ error: "message manquant", hint: "Envoyez { session_id?, message: '...' }" });
+    }
 
-  // Auto-création de session si absente
-  const { id, sess, created } = ensureSession(session_id);
-  if (created) {
-    res.setHeader("x-session-id", id);
-  }
+    // Auto-création de session si absente
+    const { id, sess, created } = ensureSession(session_id);
+    if (created) res.setHeader("x-session-id", id);
 
-  // Historique utilisateur
-  sess.history.push({ role: "user", content: message });
+    // Historique utilisateur
+    sess.history.push({ role: "user", content: message });
 
-  // Message d’accueil plus fluide si tout début
-  if (sess.history.length === 1) {
-    const welcome = "Bonjour 👋 Je suis OXV-Bot. Dites-moi simplement ce dont vous avez besoin : un plan, un devis, ou une estimation de livraison. Par exemple : « 200 palettes 800×1200 pour un usage pro ».";
-    sess.history.push({ role: "assistant", content: welcome });
-    return res.json({ session_id: id, message: welcome, state: sess.state, data: sess.data });
-  }
+    // Message d’accueil plus fluide si tout début
+    if (sess.history.length === 1) {
+      const welcome =
+        "Bonjour 👋 Je suis AOA. Dites-moi simplement ce dont vous avez besoin : un plan, un devis, ou une estimation de livraison. Par exemple : « 200 palettes 800×1200 pour un usage pro ».";
+      sess.history.push({ role: "assistant", content: welcome });
+      return res.json({ session_id: id, message: welcome, state: sess.state, data: sess.data });
+    }
 
-  // Appel OpenAI protégé
-  let content = "";
-  try {
-    if (!process.env.OPENAI_API_KEY) {
-      // Fallback sans OpenAI: réponse simple guidée
-      content = "Je peux vous générer un plan, un devis ou une estimation de transport. Précisez le modèle (ex: palette 800×1200), la quantité et l’usage (pro/particulier).";
-    } else {
-      const r = await openai.chat.completions.create({
-        model: MODEL,
-        temperature: 0.2,
-        max_tokens: 400,
-        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...sess.history]
+    // Appel OpenAI protégé
+    let content = "";
+    try {
+      if (!process.env.OPENAI_API_KEY) {
+        // Fallback sans OpenAI: réponse simple guidée
+        content =
+          "Je peux vous générer un plan, un devis ou une estimation de transport. Précisez le modèle (ex: palette 800×1200), la quantité et l’usage (pro/particulier).";
+      } else {
+        const r = await openai.chat.completions.create({
+          model: MODEL,
+          temperature: 0.2,
+          max_tokens: 400,
+          messages: [{ role: "system", content: SYSTEM_PROMPT }, ...sess.history],
+        });
+        content = r.choices?.[0]?.message?.content?.trim() || "";
+      }
+    } catch (err) {
+      console.error("OpenAI error:", err?.message || err);
+      content =
+        "Je n’ai pas pu générer de réponse pour le moment. Voulez-vous que je passe directement au plan, devis ou transport ?";
+    }
+
+    // Essaye d’extraire un JSON structuré
+    const jsonOut = extractJsonCandidate(content);
+
+    function mergeData(intent, payload) {
+      switch (intent) {
+        case "CONTACT":
+          Object.assign(sess, { data: { ...sess.data, ...ContactSchema.parse(payload) } });
+          break;
+        case "BESOINS":
+          Object.assign(sess, { data: { ...sess.data, ...BesoinsSchema.parse(payload) } });
+          break;
+        case "PLAN":
+          Object.assign(sess, { data: { ...sess.data, ...PlanSchema.parse(payload) } });
+          break;
+        case "DEVIS":
+          Object.assign(sess, { data: { ...sess.data, ...DevisSchema.parse(payload) } });
+          break;
+        case "LIVRAISON":
+          Object.assign(sess, { data: { ...sess.data, ...LivraisonSchema.parse(payload) } });
+          break;
+        default:
+          break;
+      }
+    }
+
+    if (jsonOut?.intent) {
+      // Accepte les sauts d’étapes si l’intention est claire (logique plus souple)
+      mergeData(jsonOut.intent, jsonOut);
+      if (isComplete(sess.state, sess.data)) {
+        sess.state = nextState(sess.state);
+      }
+      sess.history.push({ role: "assistant", content });
+      return res.json({ session_id: id, message: content, state: sess.state, data: sess.data });
+    }
+
+    // Pas de JSON exploitable -> réponse courte et claire
+    const short = safeShorten(content);
+    sess.history.push({ role: "assistant", content: short });
+    return res.json({ session_id: id, message: short, state: sess.state, data: sess.data });
+  })
+);
+
+app.post(
+  "/plan",
+  asyncHandler(async (req, res) => {
+    const { modele = "hexagone", diametre_mm = 3000, hauteur_mm = 900 } = req.body || {};
+    const svg = generatePlanSVG({ modele, diametre_mm, hauteur_mm });
+    const id = uuidv4();
+    const { svgPath, pdfPath } = savePlanFiles({ id, svg });
+
+    return res.json({
+      intent: "PLAN",
+      modele,
+      dimensions: { diametre_mm, hauteur_mm },
+      sortie: {
+        svg_url: makeAbsUrl(req, svgPath),
+        pdf_url: makeAbsUrl(req, pdfPath),
+      },
+    });
+  })
+);
+
+app.post(
+  "/devis",
+  asyncHandler(async (req, res) => {
+    const { panier } = req.body || {};
+    if (!Array.isArray(panier) || panier.length === 0) {
+      return res.status(400).json({
+        error: "panier invalide",
+        hint: "Ex: { panier: [{ref:'MODULE-845x1200', qty:10, prix_unitaire:25.5}] }",
       });
-      content = r.choices?.[0]?.message?.content?.trim() || "";
     }
-  } catch (err) {
-    console.error("OpenAI error:", err?.message || err);
-    content = "Je n’ai pas pu générer de réponse pour le moment. Voulez-vous que je passe directement au plan, devis ou transport ?";
-  }
+    const prix = buildQuote(panier);
+    return res.json({
+      intent: "DEVIS",
+      panier,
+      prix,
+      conditions: { validite_jours: 15, delai_fabrication_jours: 7 },
+    });
+  })
+);
 
-  // Essaye d’extraire un JSON structuré
-  const jsonOut = extractJsonCandidate(content);
-
-  function mergeData(intent, payload) {
-    switch (intent) {
-      case "CONTACT":
-        Object.assign(sess, { data: { ...sess.data, ...ContactSchema.parse(payload) } });
-        break;
-      case "BESOINS":
-        Object.assign(sess, { data: { ...sess.data, ...BesoinsSchema.parse(payload) } });
-        break;
-      case "PLAN":
-        Object.assign(sess, { data: { ...sess.data, ...PlanSchema.parse(payload) } });
-        break;
-      case "DEVIS":
-        Object.assign(sess, { data: { ...sess.data, ...DevisSchema.parse(payload) } });
-        break;
-      case "LIVRAISON":
-        Object.assign(sess, { data: { ...sess.data, ...LivraisonSchema.parse(payload) } });
-        break;
-      default:
-        break;
+app.post(
+  "/transport",
+  asyncHandler(async (req, res) => {
+    const { arrivee_cp, poids_kg, volume_m3 } = req.body || {};
+    if (!arrivee_cp || !poids_kg || !volume_m3) {
+      return res.status(400).json({
+        error: "arrivee_cp, poids_kg, volume_m3 requis",
+        hint: "Ex: { arrivee_cp:'13001', poids_kg:500, volume_m3:2.5 }",
+      });
     }
-  }
+    const out = computeTransport({ arrivee_cp, poids_kg, volume_m3 });
+    return res.json({
+      intent: "LIVRAISON",
+      depart: process.env.DEPART_VILLE || "Montlieu-la-Garde",
+      arrivee_cp,
+      poids_kg,
+      volume_m3,
+      ...out,
+    });
+  })
+);
 
-  if (jsonOut?.intent) {
-    // Accepte les sauts d’étapes si l’intention est claire (logique plus souple)
-    mergeData(jsonOut.intent, jsonOut);
-    if (isComplete(sess.state, sess.data)) {
-      sess.state = nextState(sess.state);
-    }
-    sess.history.push({ role: "assistant", content });
-    return res.json({ session_id: id, message: content, state: sess.state, data: sess.data });
-  }
+// ---------- Middleware d’erreurs ----------
+app.use(errorMiddleware);
 
-  // Pas de JSON exploitable -> réponse courte et claire
-  const short = safeShorten(content);
-  sess.history.push({ role: "assistant", content: short });
-  return res.json({ session_id: id, message: short, state: sess.state, data: sess.data });
-}));
+// ---------- Serve ----------
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = "0.0.0.0";
+app.listen(PORT, HOST, () => {
+  console.log(`AOA-API running on http://${HOST}:${PORT}`);
+});
 
-app.post("/plan", asyncHandler(async (req, res) => {
-  const { modele = "hexagone", diametre_mm = 3000, hauteur_mm = 900 } = req.body || {};
-  const svg = generatePlanSVG({ modele, diametre_mm, hauteur_mm });
-  const id = uuidv4();
-  const { svgPath, pdfPath } = savePlanFiles({ id, svg });
-
-  return res.json({
-    intent: "PLAN",
-    modele,
-    dimensions: { diametre_mm, hauteur_mm },
-    sortie: {
-      svg_url: makeAbsUrl(req, svgPath),
-      pdf_url: makeAbsUrl(req, pdfPath)
-    }
-  });
-}));
-
-app.post("/devis", asyncHandler(async (req, res) => {
-  const { panier } = req.body || {};
-  if (!Array.isArray(panier) || panier.length === 0) {
-    return res.status(400).json({ error: "panier invalide", hint: "Ex: { panier: [{ref:'MODULE-845x1200', qty:10, prix_unitaire:25.5}] }" });
-  }
-  const prix = buildQuote(panier);
-  return res.json({
-    intent: "DEVIS",
-    panier,
-    prix,
-    conditions: { validite_jours: 15, delai_fabrication_jours: 7 }
-  });
-}))
+// Heartbeat pour éviter les coupes silencieuses
+setInterval(() => console.log(`[heartbeat] ${new Date().toISOString()}`), 60_000);
 
