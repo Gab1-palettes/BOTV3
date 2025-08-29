@@ -37,7 +37,19 @@ app.post("/session/start", (req, res) => {
 
 app.post("/chat", asyncHandler(async (req, res) => {
   const { session_id, message } = req.body;
-  if (!session_id) return res.status(400).json({ error: "session_id manquant" });
+  let sess = null;
+if (!session_id || !sessions.has(session_id)) {
+  // auto-création
+  const new_id = uuidv4();
+  sess = { state: STATES.CONTACT, data: {}, history: [] };
+  sessions.set(new_id, sess);
+  console.log("Nouvelle session auto-créée:", new_id);
+  // on renvoie le session_id dans la réponse
+  res.setHeader("x-session-id", new_id);
+} else {
+  sess = sessions.get(session_id);
+}
+
   if (!message) return res.status(400).json({ error: "message manquant" });
 
   const sess = sessions.get(session_id);
