@@ -1,4 +1,4 @@
-import "dotenv/config.js";
+import "dotenv/config"; // <- plus portable que "dotenv/config.js"
 import express from "express";
 import { OpenAI } from "openai";
 import { v4 as uuidv4 } from "uuid";
@@ -43,12 +43,16 @@ app.post("/chat", asyncHandler(async (req, res) => {
   const sess = sessions.get(session_id);
   if (!sess) return res.status(404).json({ error: "session inconnue" });
 
-  const { state, data, history } = sess;
+  const { state, history } = sess;
+
+  // (optionnel mais recommandé) on garde aussi le message côté historique
+  history.push({ role: "user", content: message });
+
   const r = await openai.chat.completions.create({
     model: MODEL,
     temperature: 0.2,
     max_tokens: 300,
-    messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history, { role: "user", content: message }]
+    messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history]
   });
 
   let content = r.choices?.[0]?.message?.content?.trim() || "";
@@ -56,10 +60,10 @@ app.post("/chat", asyncHandler(async (req, res) => {
 
   function mergeData(intent, payload){
     switch (intent) {
-      case "CONTACT": Object.assign(sess, { data: { ...sess.data, ...ContactSchema.parse(payload) }}); break;
-      case "BESOINS": Object.assign(sess, { data: { ...sess.data, ...BesoinsSchema.parse(payload) }}); break;
-      case "PLAN":    Object.assign(sess, { data: { ...sess.data, ...PlanSchema.parse(payload) }}); break;
-      case "DEVIS":   Object.assign(sess, { data: { ...sess.data, ...DevisSchema.parse(payload) }}); break;
+      case "CONTACT":   Object.assign(sess, { data: { ...sess.data, ...ContactSchema.parse(payload) }}); break;
+      case "BESOINS":   Object.assign(sess, { data: { ...sess.data, ...BesoinsSchema.parse(payload) }}); break;
+      case "PLAN":      Object.assign(sess, { data: { ...sess.data, ...PlanSchema.parse(payload) }}); break;
+      case "DEVIS":     Object.assign(sess, { data: { ...sess.data, ...DevisSchema.parse(payload) }}); break;
       case "LIVRAISON": Object.assign(sess, { data: { ...sess.data, ...LivraisonSchema.parse(payload) }}); break;
     }
   }
@@ -73,7 +77,7 @@ app.post("/chat", asyncHandler(async (req, res) => {
 
   content = content.split(/[.!?]\s/).slice(0, 2).join(". ") + ".";
   history.push({ role: "assistant", content });
-  res.json({ message: content, state, data });
+  res.json({ message: content, state: sess.state, data: sess.data });
 }));
 
 app.post("/plan", asyncHandler(async (req, res) => {
@@ -81,21 +85,42 @@ app.post("/plan", asyncHandler(async (req, res) => {
   const svg = generatePlanSVG({ modele, diametre_mm, hauteur_mm });
   const id = uuidv4();
   const { svgPath, pdfPath } = savePlanFiles({ id, svg });
-  res.json({ intent: "PLAN", modele, dimensions: { diametre_mm, hauteur_mm }, sortie: { svg_url: f"/{svgPath}", pdf_url: f"/{pdfPath}" } });
+
+  // ⚠️ Correction ici: f-strings -> template literals
+  res.json({
+    intent: "PLAN",
+    modele,
+    dimensions: { diametre_mm, hauteur_mm },
+    sortie: {
+      svg_url: `/${svgPath}`,
+      pdf_url: `/${pdfPath}`
+    }
+  });
 }));
 
 app.post("/devis", asyncHandler(async (req, res) => {
   const { panier } = req.body || {};
-  if (!Array.isArray(panier) || panier.length === 0) return res.status(400).json({ error: "panier invalide" });
+  if (!Array.isArray(panier) || panier.length === 0) {
+    return res.status(400).json({ error: "panier invalide" });
+  }
   const prix = buildQuote(panier);
   res.json({ intent: "DEVIS", panier, prix, conditions: { validite_jours: 15, delai_fabrication_jours: 7 } });
 }));
 
 app.post("/transport", asyncHandler(async (req, res) => {
   const { arrivee_cp, poids_kg, volume_m3 } = req.body || {};
-  if (!arrivee_cp || !poids_kg || !volume_m3) return res.status(400).json({ error: "arrivee_cp, poids_kg, volume_m3 requis" });
+  if (!arrivee_cp || !poids_kg || !volume_m3) {
+    return res.status(400).json({ error: "arrivee_cp, poids_kg, volume_m3 requis" });
+  }
   const out = computeTransport({ arrivee_cp, poids_kg, volume_m3 });
-  res.json({ intent: "LIVRAISON", depart: process.env.DEPART_VILLE || "Montlieu-la-Garde", arrivee_cp, poids_kg, volume_m3, ...out });
+  res.json({
+    intent: "LIVRAISON",
+    depart: process.env.DEPART_VILLE || "Montlieu-la-Garde",
+    arrivee_cp,
+    poids_kg,
+    volume_m3,
+    ...out
+  });
 }));
 
 app.use("/storage", express.static("storage"));
