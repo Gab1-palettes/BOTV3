@@ -1,3 +1,13 @@
+// ---- Handlers de robustesse (à placer en tout début) ----
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err?.stack || err);
+  // ne pas process.exit; on continue pour que Render ne coupe pas
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[unhandledRejection]", reason);
+  // ne pas process.exit
+});
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
